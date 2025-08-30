@@ -32,7 +32,8 @@ K3_CONFIG_PATH = os.getenv("K3_CONFIG_PATH", "").strip()
 K3_CONFIG_NODE = os.getenv("K3_CONFIG_NODE", "config").strip()
 
 # ===================== Query params ===================
-K3_USE_ORG_ID = os.getenv("K3_USE_ORG_ID", "1148519")  # <- FUseOrgId desde .env o conf.ini si lo lees aparte
+K3_USE_ORG_ID  = os.getenv("K3_USE_ORG_ID", "1148519")
+K3_USE_ORG_IDS = os.getenv("K3_USE_ORG_IDS", "").strip()
 FORM_ID       = os.getenv("FORM_ID", "BD_MATERIAL")
 FIELD_KEYS    = os.getenv(
     "FIELD_KEYS",
@@ -93,33 +94,33 @@ def _clamp_per_page(n: int) -> int:
         return 5000
     return min(n, MAX_LIMIT)
 
-def build_filters() -> List[dict]:
-    """
-    Filtro base por organización (FUseOrgId = K3_USE_ORG_ID).
-    Logic=0 (AND) para que se combine correctamente con filtros extra.
-    """
+def _extra_filters() -> List[dict]:
+    if not EXTRA_FILTERS_JSON:
+        return []
+    try:
+        extra = json.loads(EXTRA_FILTERS_JSON)
+        return extra if isinstance(extra, list) else []
+    except Exception:
+        print("[WARN] EXTRA_FILTERS_JSON no es JSON válido; ignorando.")
+        return []
+
+def build_filters_for_org(org_id: str) -> List[dict]:
     base = [{
         "Left": "(",
         "FieldName": "FUseOrgId",
         "Compare": "67",             # '='
-        "Value": str(K3_USE_ORG_ID),
+        "Value": str(org_id),
         "Right": ")",
         "Logic": 0                   # AND
     }]
-    if EXTRA_FILTERS_JSON:
-        try:
-            extra = json.loads(EXTRA_FILTERS_JSON)
-            if isinstance(extra, list):
-                base.extend(extra)
-        except Exception:
-            print("[WARN] EXTRA_FILTERS_JSON no es JSON válido; ignorando.")
+    base.extend(_extra_filters())
     return base
 
-def build_execute_payload(offset: int, limit: int) -> dict:
+def build_execute_payload(org_id: str, offset: int, limit: int) -> dict:
     return {
         "FormId": FORM_ID,
         "FieldKeys": FIELD_KEYS,
-        "FilterString": build_filters(),
+        "FilterString": build_filters_for_org(org_id),
         "OrderString": ORDER_STRING,
         "TopRowCount": TOP_ROW_COUNT,
         "StartRow": offset,
@@ -165,20 +166,14 @@ def safe_execute_bill_query(sdk: K3CloudApiSdk, para: dict) -> Any:
     except Exception:
         return sdk.ExecuteBillQuery(json.dumps(para, ensure_ascii=False))
 
-def page_all(sdk: K3CloudApiSdk) -> List[Any]:
-    """
-    Descarga TODAS las páginas concatenando los resultados (lista de listas)
-    para los materiales filtrados por FUseOrgId.
-    """
+def page_all_for_org(sdk: K3CloudApiSdk, org_id: str) -> List[Any]:
     all_rows: List[Any] = []
     offset = START_ROW
     per_page = _clamp_per_page(LIMIT)
 
     while True:
-        payload = build_execute_payload(offset, per_page)
+        payload = build_execute_payload(org_id, offset, per_page)
         raw = safe_execute_bill_query(sdk, payload)
-
-        # Normaliza a objeto Python
         try:
             data: Union[list, dict, str] = json.loads(raw) if isinstance(raw, str) else raw
         except Exception:
@@ -190,27 +185,27 @@ def page_all(sdk: K3CloudApiSdk) -> List[Any]:
         if isinstance(data, list):
             batch_count = len(data)
             all_rows.extend(data)
-            print(f"[PAGE] StartRow={offset} +{batch_count} filas")
-            # Si llega menos que per_page, no hay más páginas
+            print(f"[PAGE org={org_id}] StartRow={offset} +{batch_count} filas")
             if batch_count < per_page:
                 break
             offset += batch_count
         else:
-            # Respuesta no-lista (raro en ExecuteBillQuery): guardamos y salimos
             all_rows.append(data)
-            print(f"[PAGE] StartRow={offset} objeto recibido (no lista), se detiene paginación.")
+            print(f"[PAGE org={org_id}] StartRow={offset} objeto recibido (no lista), se detiene paginación.")
             break
 
-    print(f"[PAGE] Total filas acumuladas: {len(all_rows)}")
+    print(f"[PAGE org={org_id}] Total filas acumuladas: {len(all_rows)}")
     return all_rows
 
-def dump_json(obj: Any) -> pathlib.Path:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def dump_json(obj: Any, org_id: str) -> pathlib.Path:
+    # Guardar en subcarpeta por org para orden
+    out_dir = OUT_DIR / f"org_{org_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    outfile = OUT_DIR / f"{FILE_PREFIX}_{K3_USE_ORG_ID}_{ts}.json"
+    outfile = out_dir / f"{FILE_PREFIX}_{org_id}_{ts}.json"
     with outfile.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=(2 if PRETTY_JSON else None))
-    print(f"[DUMP] {outfile}")
+    print(f"[DUMP org={org_id}] {outfile}")
     return outfile
 
 def exec_sp_with_path(json_path: pathlib.Path) -> None:
@@ -220,21 +215,38 @@ def exec_sp_with_path(json_path: pathlib.Path) -> None:
         con.commit()
     print(f"[SQL] Ejecutado {SP_TO_CALL} {SP_PARAM}='{json_path}'")
 
+def _parse_org_ids() -> List[str]:
+    """
+    Si hay K3_USE_ORG_IDS (coma-separado), úsalo.
+    Si no, usa K3_USE_ORG_ID único.
+    """
+    if K3_USE_ORG_IDS:
+        parts = [p.strip() for p in K3_USE_ORG_IDS.split(",")]
+        return [p for p in parts if p]
+    return [str(K3_USE_ORG_ID).strip()]
+
 # ===================== Main ===========================
 def main() -> int:
     sdk = k3_client()
-    rows = page_all(sdk)
-    rows_for_dump = rows_to_dicts(rows, FIELD_KEYS) if DUMP_AS_DICTS else rows
-    outfile = dump_json(rows_for_dump)
+    org_ids = _parse_org_ids()
 
-    if DRY_RUN:
-        print("[INFO] DRY_RUN=1: no se llama al SP.")
-        return 0
+    for org_id in org_ids:
+        try:
+            rows = page_all_for_org(sdk, org_id)
+            rows_for_dump = rows_to_dicts(rows, FIELD_KEYS) if DUMP_AS_DICTS else rows
+            outfile = dump_json(rows_for_dump, org_id)
 
-    # Cuando lo quieras activar:
-    exec_sp_with_path(outfile)
+            if DRY_RUN:
+                print(f"[INFO org={org_id}] DRY_RUN=1: no se llama al SP.")
+                continue
 
-    print("[DONE] Proceso completo.")
+            #exec_sp_with_path(outfile)
+
+        except Exception as e:
+            print(f"[ERR org={org_id}] {e}")
+            # sigue con la siguiente org sin abortar todo el proceso
+
+    print("[DONE] Proceso completo (todas las orgs).")
     return 0
 
 if __name__ == "__main__":
