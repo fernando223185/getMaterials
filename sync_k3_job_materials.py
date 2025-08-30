@@ -1,0 +1,245 @@
+from __future__ import annotations
+import os, json, datetime, pathlib, sys
+from typing import Any, List, Union
+from dotenv import load_dotenv
+import pyodbc
+import configparser
+from pathlib import Path
+
+# SDK oficial
+from k3cloud_webapi_sdk.main import K3CloudApiSdk
+
+load_dotenv()
+
+# ===================== Config SQL =====================
+SQL_SERVER   = os.getenv("SQL_SERVER",   "localhost")
+SQL_DB       = os.getenv("SQL_DB",       "YourDB")
+SQL_USER     = os.getenv("SQL_USER",     "sa")
+SQL_PASSWORD = os.getenv("SQL_PASSWORD", "P@ssw0rd!")
+ODBC_DRIVER  = os.getenv("ODBC_DRIVER",  "ODBC Driver 18 for SQL Server")
+SP_TO_CALL   = os.getenv("SP_TO_CALL",   "dbo.spUpdateProductsFromJsonFile")  # tu SP
+SP_PARAM     = os.getenv("SP_PARAM",     "@jsonPath")                    # nombre del parámetro
+
+# ===================== Config K3 ======================
+K3_SERVER_URL  = os.getenv("K3_SERVER_URL", "http://127.0.0.1:8090/K3Cloud/")
+K3_ACCTID      = os.getenv("K3_ACCTID",     "")
+K3_USERNAME    = os.getenv("K3_USERNAME",   "")
+K3_APPID       = os.getenv("K3_APPID",      "")
+K3_APPSEC      = os.getenv("K3_APPSEC",     "")
+K3_LCID        = int(os.getenv("K3_LCID",   "2052"))
+K3_ORGNUM      = os.getenv("K3_ORGNUM",     "100")
+K3_CONFIG_PATH = os.getenv("K3_CONFIG_PATH", "").strip()
+K3_CONFIG_NODE = os.getenv("K3_CONFIG_NODE", "config").strip()
+
+# ===================== Query params ===================
+K3_USE_ORG_ID = os.getenv("K3_USE_ORG_ID", "1148519")  # <- FUseOrgId desde .env o conf.ini si lo lees aparte
+FORM_ID       = os.getenv("FORM_ID", "BD_MATERIAL")
+FIELD_KEYS    = os.getenv(
+    "FIELD_KEYS",
+    "FMATERIALID,FNUMBER,FNAME,F_BOX_VOLUME,F_price_effect_num,F_TQOY_Price_9s2"
+)
+ORDER_STRING  = os.getenv("ORDER_STRING", "FNUMBER ASC")
+TOP_ROW_COUNT = int(os.getenv("TOP_ROW_COUNT", "0"))
+START_ROW     = int(os.getenv("START_ROW", "0"))
+LIMIT         = int(os.getenv("LIMIT", "5000"))  # <= 10000 por página
+SUBSYSTEM_ID  = os.getenv("SUBSYSTEM_ID", "")
+EXTRA_FILTERS_JSON = os.getenv("EXTRA_FILTERS_JSON", "").strip()
+
+# ===================== Dump / archivo =================
+OUT_DIR     = pathlib.Path(os.getenv("OUT_DIR", r"C:\devs_python\k3_dumps\Materials"))
+FILE_PREFIX = os.getenv("FILE_PREFIX", "k3_bd_material")
+DRY_RUN     = os.getenv("DRY_RUN", "0") in ("1", "true", "True", "YES", "yes")
+DUMP_AS_DICTS = os.getenv("DUMP_AS_DICTS", "1") in ("1","true","True","YES","yes")
+PRETTY_JSON   = os.getenv("PRETTY_JSON", "0") in ("1","true","True","YES","yes")
+# ===================== Constantes =====================
+MAX_LIMIT = 10000  # ExecuteBillQuery no permite > 10000
+
+# ===================== Utilidades =====================
+def sql_connect() -> pyodbc.Connection:
+    conn_str = (
+        f"DRIVER={{{ODBC_DRIVER}}};SERVER={SQL_SERVER};DATABASE={SQL_DB};"
+        f"UID={SQL_USER};PWD={SQL_PASSWORD};TrustServerCertificate=yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=False)
+
+def _normalize_server_url(url: str) -> str:
+    # Evita doble "//K3Cloud/"
+    return url.replace("//K3Cloud/", "/K3Cloud/")
+
+def k3_client() -> K3CloudApiSdk:
+    sdk = K3CloudApiSdk(server_url=K3_SERVER_URL)
+    if K3_CONFIG_PATH:
+        conf_path = Path(os.path.expandvars(os.path.expanduser(K3_CONFIG_PATH))).resolve()
+        if conf_path.exists():
+            sdk.Init(config_path=str(conf_path), config_node=K3_CONFIG_NODE)
+            return sdk
+        else:
+            raise FileNotFoundError(f"conf.ini no encontrado: {conf_path}")
+
+    # Fallback: usar InitConfig con variables de entorno
+    sdk.InitConfig(
+        acct_id=K3_ACCTID,
+        user_name=K3_USERNAME,
+        app_id=K3_APPID,
+        app_secret=K3_APPSEC,
+        server_url=K3_SERVER_URL,
+        lcid=K3_LCID,
+        org_num=K3_ORGNUM,
+    )
+    return sdk
+
+def _clamp_per_page(n: int) -> int:
+    if not n or n <= 0:
+        return 5000
+    return min(n, MAX_LIMIT)
+
+def build_filters() -> List[dict]:
+    """
+    Filtro base por organización (FUseOrgId = K3_USE_ORG_ID).
+    Logic=0 (AND) para que se combine correctamente con filtros extra.
+    """
+    base = [{
+        "Left": "(",
+        "FieldName": "FUseOrgId",
+        "Compare": "67",             # '='
+        "Value": str(K3_USE_ORG_ID),
+        "Right": ")",
+        "Logic": 0                   # AND
+    }]
+    if EXTRA_FILTERS_JSON:
+        try:
+            extra = json.loads(EXTRA_FILTERS_JSON)
+            if isinstance(extra, list):
+                base.extend(extra)
+        except Exception:
+            print("[WARN] EXTRA_FILTERS_JSON no es JSON válido; ignorando.")
+    return base
+
+def build_execute_payload(offset: int, limit: int) -> dict:
+    return {
+        "FormId": FORM_ID,
+        "FieldKeys": FIELD_KEYS,
+        "FilterString": build_filters(),
+        "OrderString": ORDER_STRING,
+        "TopRowCount": TOP_ROW_COUNT,
+        "StartRow": offset,
+        "Limit": limit,              # <= 10000
+        "SubSystemId": SUBSYSTEM_ID
+    }
+
+
+def rows_to_dicts(rows: List[Any], field_keys: str) -> List[dict]:
+    """
+    Convierte [["v1","v2",...], ...] a [{key1:v1, key2:v2, ...}, ...]
+    usando el orden de FIELD_KEYS. Si faltan valores, rellena con None.
+    Si la fila ya viene como dict, la deja tal cual.
+    """
+    keys = [k.strip() for k in field_keys.split(",") if k.strip()]
+    out: List[dict] = []
+    for r in rows:
+        if isinstance(r, dict):
+            out.append(r)
+            continue
+        if not isinstance(r, (list, tuple)):
+            # ignora filas raras
+            continue
+        d = {}
+        # mapea hasta la longitud menor
+        m = min(len(r), len(keys))
+        for i in range(m):
+            d[keys[i]] = r[i]
+        # rellena faltantes con None
+        for i in range(m, len(keys)):
+            d[keys[i]] = None
+        out.append(d)
+    return out
+
+
+def safe_execute_bill_query(sdk: K3CloudApiSdk, para: dict) -> Any:
+    """
+    El SDK a veces acepta dict y a veces JSON string.
+    Probamos dict y si falla, probamos string.
+    """
+    try:
+        return sdk.ExecuteBillQuery(para)
+    except Exception:
+        return sdk.ExecuteBillQuery(json.dumps(para, ensure_ascii=False))
+
+def page_all(sdk: K3CloudApiSdk) -> List[Any]:
+    """
+    Descarga TODAS las páginas concatenando los resultados (lista de listas)
+    para los materiales filtrados por FUseOrgId.
+    """
+    all_rows: List[Any] = []
+    offset = START_ROW
+    per_page = _clamp_per_page(LIMIT)
+
+    while True:
+        payload = build_execute_payload(offset, per_page)
+        raw = safe_execute_bill_query(sdk, payload)
+
+        # Normaliza a objeto Python
+        try:
+            data: Union[list, dict, str] = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            data = raw
+
+        if not data:
+            break
+
+        if isinstance(data, list):
+            batch_count = len(data)
+            all_rows.extend(data)
+            print(f"[PAGE] StartRow={offset} +{batch_count} filas")
+            # Si llega menos que per_page, no hay más páginas
+            if batch_count < per_page:
+                break
+            offset += batch_count
+        else:
+            # Respuesta no-lista (raro en ExecuteBillQuery): guardamos y salimos
+            all_rows.append(data)
+            print(f"[PAGE] StartRow={offset} objeto recibido (no lista), se detiene paginación.")
+            break
+
+    print(f"[PAGE] Total filas acumuladas: {len(all_rows)}")
+    return all_rows
+
+def dump_json(obj: Any) -> pathlib.Path:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    outfile = OUT_DIR / f"{FILE_PREFIX}_{K3_USE_ORG_ID}_{ts}.json"
+    with outfile.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=(2 if PRETTY_JSON else None))
+    print(f"[DUMP] {outfile}")
+    return outfile
+
+def exec_sp_with_path(json_path: pathlib.Path) -> None:
+    with sql_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(f"EXEC {SP_TO_CALL} {SP_PARAM} = ?", str(json_path))
+        con.commit()
+    print(f"[SQL] Ejecutado {SP_TO_CALL} {SP_PARAM}='{json_path}'")
+
+# ===================== Main ===========================
+def main() -> int:
+    sdk = k3_client()
+    rows = page_all(sdk)
+    rows_for_dump = rows_to_dicts(rows, FIELD_KEYS) if DUMP_AS_DICTS else rows
+    outfile = dump_json(rows_for_dump)
+
+    if DRY_RUN:
+        print("[INFO] DRY_RUN=1: no se llama al SP.")
+        return 0
+
+    # Cuando lo quieras activar:
+    exec_sp_with_path(outfile)
+
+    print("[DONE] Proceso completo.")
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"[ERR] {e}")
+        sys.exit(1)
