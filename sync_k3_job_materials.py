@@ -240,7 +240,7 @@ def main() -> int:
                 print(f"[INFO org={org_id}] DRY_RUN=1: no se llama al SP.")
                 continue
 
-            #exec_sp_with_path(outfile)
+            exec_sp_with_path(outfile)
 
         except Exception as e:
             print(f"[ERR org={org_id}] {e}")
