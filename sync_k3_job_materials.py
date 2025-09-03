@@ -3,8 +3,8 @@ import os, json, datetime, pathlib, sys
 from typing import Any, List, Union
 from dotenv import load_dotenv
 import pyodbc
-import configparser
 from pathlib import Path
+from decimal import Decimal, InvalidOperation, localcontext, ROUND_HALF_UP
 
 # SDK oficial
 from k3cloud_webapi_sdk.main import K3CloudApiSdk
@@ -18,7 +18,7 @@ SQL_USER     = os.getenv("SQL_USER",     "sa")
 SQL_PASSWORD = os.getenv("SQL_PASSWORD", "P@ssw0rd!")
 ODBC_DRIVER  = os.getenv("ODBC_DRIVER",  "ODBC Driver 18 for SQL Server")
 SP_TO_CALL   = os.getenv("SP_TO_CALL",   "dbo.spUpdateProductsFromJsonFile")  # tu SP
-SP_PARAM     = os.getenv("SP_PARAM",     "@jsonPath")                    # nombre del parámetro
+SP_PARAM     = os.getenv("SP_PARAM",     "@jsonPath")                         # nombre del parámetro
 
 # ===================== Config K3 ======================
 K3_SERVER_URL  = os.getenv("K3_SERVER_URL", "http://127.0.0.1:8090/K3Cloud/")
@@ -34,24 +34,33 @@ K3_CONFIG_NODE = os.getenv("K3_CONFIG_NODE", "config").strip()
 # ===================== Query params ===================
 K3_USE_ORG_ID  = os.getenv("K3_USE_ORG_ID", "1148519")
 K3_USE_ORG_IDS = os.getenv("K3_USE_ORG_IDS", "").strip()
-FORM_ID       = os.getenv("FORM_ID", "BD_MATERIAL")
-FIELD_KEYS    = os.getenv(
+FORM_ID        = os.getenv("FORM_ID", "BD_MATERIAL")
+FIELD_KEYS     = os.getenv(
     "FIELD_KEYS",
     "FMATERIALID,FNUMBER,FNAME,F_BOX_VOLUME,F_price_effect_num,F_TQOY_Price_9s2"
 )
-ORDER_STRING  = os.getenv("ORDER_STRING", "FNUMBER ASC")
-TOP_ROW_COUNT = int(os.getenv("TOP_ROW_COUNT", "0"))
-START_ROW     = int(os.getenv("START_ROW", "0"))
-LIMIT         = int(os.getenv("LIMIT", "5000"))  # <= 10000 por página
-SUBSYSTEM_ID  = os.getenv("SUBSYSTEM_ID", "")
+ORDER_STRING   = os.getenv("ORDER_STRING", "FNUMBER ASC")
+TOP_ROW_COUNT  = int(os.getenv("TOP_ROW_COUNT", "0"))
+START_ROW      = int(os.getenv("START_ROW", "0"))
+LIMIT          = int(os.getenv("LIMIT", "5000"))  # <= 10000 por página
+SUBSYSTEM_ID   = os.getenv("SUBSYSTEM_ID", "")
 EXTRA_FILTERS_JSON = os.getenv("EXTRA_FILTERS_JSON", "").strip()
 
 # ===================== Dump / archivo =================
-OUT_DIR     = pathlib.Path(os.getenv("OUT_DIR", r"C:\devs_python\k3_dumps\Materials"))
-FILE_PREFIX = os.getenv("FILE_PREFIX", "k3_bd_material")
-DRY_RUN     = os.getenv("DRY_RUN", "0") in ("1", "true", "True", "YES", "yes")
+OUT_DIR       = pathlib.Path(os.getenv("OUT_DIR", r"C:\devs_python\k3_dumps\Materials"))
+FILE_PREFIX   = os.getenv("FILE_PREFIX", "k3_bd_material")
+DRY_RUN       = os.getenv("DRY_RUN", "0") in ("1", "true", "True", "YES", "yes")
 DUMP_AS_DICTS = os.getenv("DUMP_AS_DICTS", "1") in ("1","true","True","YES","yes")
 PRETTY_JSON   = os.getenv("PRETTY_JSON", "0") in ("1","true","True","YES","yes")
+
+# Normalización a string decimal fijo (activar/desactivar)
+NORMALIZE_NUMERIC_STR = os.getenv("NORMALIZE_NUMERIC_STR", "1") in ("1","true","True","YES","yes")
+
+# Decimales por campo (configurables por .env)
+PLACES_PRICE        = int(os.getenv("PLACES_PRICE",       "2"))  # F_TQOY_Price_9s2
+PLACES_PIEZASXCAJA  = int(os.getenv("PLACES_PIEZASXCAJA", "3"))  # F_price_effect_num
+PLACES_BOX_VOLUME   = int(os.getenv("PLACES_BOX_VOLUME",  "6"))  # F_BOX_VOLUME
+
 # ===================== Constantes =====================
 MAX_LIMIT = 10000  # ExecuteBillQuery no permite > 10000
 
@@ -128,7 +137,6 @@ def build_execute_payload(org_id: str, offset: int, limit: int) -> dict:
         "SubSystemId": SUBSYSTEM_ID
     }
 
-
 def rows_to_dicts(rows: List[Any], field_keys: str) -> List[dict]:
     """
     Convierte [["v1","v2",...], ...] a [{key1:v1, key2:v2, ...}, ...]
@@ -145,16 +153,13 @@ def rows_to_dicts(rows: List[Any], field_keys: str) -> List[dict]:
             # ignora filas raras
             continue
         d = {}
-        # mapea hasta la longitud menor
         m = min(len(r), len(keys))
         for i in range(m):
             d[keys[i]] = r[i]
-        # rellena faltantes con None
         for i in range(m, len(keys)):
             d[keys[i]] = None
         out.append(d)
     return out
-
 
 def safe_execute_bill_query(sdk: K3CloudApiSdk, para: dict) -> Any:
     """
@@ -197,6 +202,41 @@ def page_all_for_org(sdk: K3CloudApiSdk, org_id: str) -> List[Any]:
     print(f"[PAGE org={org_id}] Total filas acumuladas: {len(all_rows)}")
     return all_rows
 
+# =============== Normalización numérica a string =======
+def _fmt_decimal_str(value, places: int) -> str | None:
+    """Convierte número (incluye '6.125e-05') a string decimal fijo sin notación científica."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        with localcontext() as ctx:
+            ctx.prec = 34  # alta precisión
+            d = Decimal(s)  # entiende notación científica
+            step = Decimal(1).scaleb(-places)  # 10^-places
+            d = d.quantize(step, rounding=ROUND_HALF_UP)
+            return format(d, f".{places}f")    # fuerza decimal plano
+    except InvalidOperation:
+        # Si viene basura, lo devolvemos tal cual; lo capturas en SQL con TRY_CAST
+        return s
+
+_DECIMAL_FORMATS = {
+    "F_TQOY_Price_9s2":   PLACES_PRICE,
+    "F_price_effect_num": PLACES_PIEZASXCAJA,
+    "F_BOX_VOLUME":       PLACES_BOX_VOLUME,
+}
+
+def _normalize_numeric_fields(row: dict) -> dict:
+    """Devuelve el dict con campos numéricos formateados como string decimal fijo."""
+    if not NORMALIZE_NUMERIC_STR:
+        return row
+    for k, places in _DECIMAL_FORMATS.items():
+        if k in row and row[k] is not None:
+            row[k] = _fmt_decimal_str(row[k], places)
+    return row
+
+# ===================== Dump / JSON =====================
 def dump_json(obj: Any, org_id: str) -> pathlib.Path:
     # Guardar en subcarpeta por org para orden
     out_dir = OUT_DIR / f"org_{org_id}"
@@ -208,6 +248,7 @@ def dump_json(obj: Any, org_id: str) -> pathlib.Path:
     print(f"[DUMP org={org_id}] {outfile}")
     return outfile
 
+# ===================== Ejecutar SP =====================
 def exec_sp_with_path(json_path: pathlib.Path) -> None:
     with sql_connect() as con:
         with con.cursor() as cur:
@@ -234,6 +275,13 @@ def main() -> int:
         try:
             rows = page_all_for_org(sdk, org_id)
             rows_for_dump = rows_to_dicts(rows, FIELD_KEYS) if DUMP_AS_DICTS else rows
+
+            # Normaliza campos numéricos a string decimal fijo (sin 'e-05')
+            if isinstance(rows_for_dump, list):
+                rows_for_dump = [_normalize_numeric_fields(dict(r)) for r in rows_for_dump]
+            elif isinstance(rows_for_dump, dict):
+                rows_for_dump = _normalize_numeric_fields(rows_for_dump)
+
             outfile = dump_json(rows_for_dump, org_id)
 
             if DRY_RUN:
