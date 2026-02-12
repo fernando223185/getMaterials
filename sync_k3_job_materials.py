@@ -18,7 +18,8 @@ SQL_USER     = os.getenv("SQL_USER",     "sa")
 SQL_PASSWORD = os.getenv("SQL_PASSWORD", "P@ssw0rd!")
 ODBC_DRIVER  = os.getenv("ODBC_DRIVER",  "ODBC Driver 18 for SQL Server")
 SP_TO_CALL   = os.getenv("SP_TO_CALL",   "dbo.spUpdateProductsFromJsonFile")  # tu SP
-SP_PARAM     = os.getenv("SP_PARAM",     "@jsonPath")                         # nombre del parámetro
+SP_PARAM     = os.getenv("SP_PARAM",     "@path")                         # nombre del parámetro
+SP_PARAM_ORG = os.getenv("SP_PARAM_ORG", "@branchId")                          # parámetro org_id
 
 # ===================== Config K3 ======================
 K3_SERVER_URL  = os.getenv("K3_SERVER_URL", "http://127.0.0.1:8090/K3Cloud/")
@@ -225,6 +226,8 @@ _DECIMAL_FORMATS = {
     "F_TQOY_Price_9s2":   PLACES_PRICE,
     "F_price_effect_num": PLACES_PIEZASXCAJA,
     "F_BOX_VOLUME":       PLACES_BOX_VOLUME,
+    "FNETWEIGHT":           PLACES_BOX_VOLUME,
+    "FGROSSWEIGHT":         PLACES_BOX_VOLUME,
 }
 
 def _normalize_numeric_fields(row: dict) -> dict:
@@ -249,12 +252,19 @@ def dump_json(obj: Any, org_id: str) -> pathlib.Path:
     return outfile
 
 # ===================== Ejecutar SP =====================
-def exec_sp_with_path(json_path: pathlib.Path) -> None:
+def exec_sp_with_path(json_path: pathlib.Path, org_id: str) -> None:
     with sql_connect() as con:
         with con.cursor() as cur:
-            cur.execute(f"EXEC {SP_TO_CALL} {SP_PARAM} = ?", str(json_path))
+            cur.execute(f"EXEC {SP_TO_CALL} {SP_PARAM} = ?, {SP_PARAM_ORG} = ?", str(json_path), org_id)
         con.commit()
-    print(f"[SQL] Ejecutado {SP_TO_CALL} {SP_PARAM}='{json_path}'")
+    print(f"[SQL] Ejecutado {SP_TO_CALL} {SP_PARAM}='{json_path}', {SP_PARAM_ORG}='{org_id}'")
+    
+    # Eliminar archivo JSON después de SP exitoso
+    try:
+        json_path.unlink()
+        print(f"[CLEANUP] Archivo eliminado: {json_path}")
+    except Exception as e:
+        print(f"[WARN] No se pudo eliminar {json_path}: {e}")
 
 def _parse_org_ids() -> List[str]:
     """
@@ -288,7 +298,7 @@ def main() -> int:
                 print(f"[INFO org={org_id}] DRY_RUN=1: no se llama al SP.")
                 continue
 
-            exec_sp_with_path(outfile)
+            exec_sp_with_path(outfile, org_id)
 
         except Exception as e:
             print(f"[ERR org={org_id}] {e}")
