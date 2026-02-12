@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, json, datetime, pathlib, sys
+import os, json, datetime, pathlib, sys, time
 from typing import Any, List, Union
 from dotenv import load_dotenv
 import pyodbc
@@ -278,6 +278,7 @@ def _parse_org_ids() -> List[str]:
 
 # ===================== Main ===========================
 def main() -> int:
+    start_time = time.time()
     sdk = k3_client()
     org_ids = _parse_org_ids()
 
@@ -304,7 +305,8 @@ def main() -> int:
             print(f"[ERR org={org_id}] {e}")
             # sigue con la siguiente org sin abortar todo el proceso
 
-    print("[DONE] Proceso completo (todas las orgs).")
+    elapsed_time = time.time() - start_time
+    print(f"[DONE] Proceso completo (todas las orgs). Tiempo: {elapsed_time:.2f}s")
     return 0
 
 if __name__ == "__main__":
