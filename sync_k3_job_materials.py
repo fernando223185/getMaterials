@@ -276,6 +276,28 @@ def _parse_org_ids() -> List[str]:
         return [p for p in parts if p]
     return [str(K3_USE_ORG_ID).strip()]
 
+def fix_mojibake(s: str) -> str:
+    """
+    Arregla texto tipo 'PORTÃ¡TIL' -> 'PORTáTIL'.
+    Si no aplica, regresa igual.
+    """
+    if not s:
+        return s
+    # Heurística: solo intentar si parece mojibake típico
+    if "Ã" not in s and "Â" not in s:
+        return s
+    try:
+        return s.encode("latin1").decode("utf-8")
+    except Exception:
+        return s
+
+def fix_text_fields(row: dict) -> dict:
+    # Arregla campos de texto conocidos
+    for k in ("FNAME", "FSpecification", "FUseOrgId.FNAME", "FUnitId_CMK.Fname"):
+        if k in row and isinstance(row[k], str):
+            row[k] = fix_mojibake(row[k])
+    return row
+
 # ===================== Main ===========================
 def main() -> int:
     start_time = time.time()
@@ -289,9 +311,9 @@ def main() -> int:
 
             # Normaliza campos numéricos a string decimal fijo (sin 'e-05')
             if isinstance(rows_for_dump, list):
-                rows_for_dump = [_normalize_numeric_fields(dict(r)) for r in rows_for_dump]
+                rows_for_dump = [fix_text_fields(_normalize_numeric_fields(dict(r))) for r in rows_for_dump]
             elif isinstance(rows_for_dump, dict):
-                rows_for_dump = _normalize_numeric_fields(rows_for_dump)
+                rows_for_dump = fix_text_fields(_normalize_numeric_fields(rows_for_dump))
 
             outfile = dump_json(rows_for_dump, org_id)
 
